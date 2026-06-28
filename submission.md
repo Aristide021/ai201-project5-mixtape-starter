@@ -2,7 +2,13 @@
 
 ## AI Usage
 
-I used Claude Code (claude-sonnet-4-6) throughout this project. During codebase orientation, I had it read all service files and explain each module's responsibility and how they connect. For bug investigation, I read the relevant service files myself first to form hypotheses, then used Claude to confirm my understanding — for example, asking it to explain what `today.weekday()` returns vs. `isoweekday()` to verify the Issue #1 diagnosis, and to compare the `add_to_playlist` and `rate_song` code paths side-by-side to confirm Issue #4's missing notification. The fixes themselves came from direct code reading rather than AI suggestion — Claude helped verify reasoning but the root cause in each case was visible in the code once I knew where to look.
+I used Claude Code (claude-sonnet-4-6) as an AI pair programmer throughout this project.
+
+**During orientation:** I pasted each service file into Claude and asked "What is this module responsible for? What are its main functions and what does each one do?" This helped me build a mental model of the service layer quickly. I also asked it to trace the data flow for a user rating a song across routes/ and services/.
+
+**During investigation:** I used Claude to explain Python's `datetime.weekday()` vs `isoweekday()` once I had already narrowed Issue #1 to the date comparison — I needed to confirm exactly what each method returns for Sunday before I was confident in the diagnosis. For Issue #4, I described the symptom and asked Claude to spot the structural difference between `add_to_playlist()` and `rate_song()` after I had already read both functions. For Issue #3, I asked whether a SQLAlchemy `outerjoin` without `.distinct()` could produce duplicate model instances — Claude confirmed it could and explained why.
+
+**Where I verified myself:** In every case I read the relevant code myself first, formed a hypothesis, then used Claude to check my reasoning rather than to find the bug. The navigation — which file to look at, which function to trace — was mine. Claude was wrong once: when I described Issue #2 and asked what the right threshold should be for "listening now," it suggested 15 minutes; I used 30 based on reading the feature description more carefully.
 
 ---
 
@@ -10,39 +16,52 @@ I used Claude Code (claude-sonnet-4-6) throughout this project. During codebase 
 
 ### Main Files and Their Roles
 
-**`app.py`** — Flask app factory. Creates the Flask app, initializes SQLAlchemy, and registers all route blueprints. Running `create_app()` is the entry point.
+**`app.py`** — Flask app factory. Initializes SQLAlchemy and registers the four route blueprints (songs, playlists, users, feed). The entry point is `create_app()` — the README warns not to run `python app.py` directly because it triggers a double-import error with SQLAlchemy.
 
-**`models.py`** — Defines 6 SQLAlchemy models: `User`, `Song`, `Tag`, `ListeningEvent`, `Rating`, `Playlist`, `Notification`, plus 3 association tables: `friendships` (User ↔ User many-to-many), `song_tags` (Song ↔ Tag many-to-many), and `playlist_entries` (Playlist ↔ Song many-to-many with a `position` integer for ordering and `added_by` FK).
+**`models.py`** — Defines 7 SQLAlchemy models and 3 association tables:
+- `User` — has `listening_streak` (int) and `last_listened_at` (datetime) stored directly on the user row, not derived
+- `Song` — has `shared_by` FK pointing to the User who originally shared it; this is what notification logic uses to find who to notify
+- `Tag` — simple name table, linked to Song via `song_tags` (many-to-many)
+- `ListeningEvent` — one row per listen, with `user_id`, `song_id`, `listened_at`
+- `Rating` — one row per (user, song) pair with a `UNIQUE` constraint; score is 1–5
+- `Playlist` — has `is_collaborative` boolean; linked to Song via `playlist_entries`
+- `Notification` — has `notification_type` (string), `body` (text), `read` (bool)
+- `playlist_entries` — the join table between Playlist and Song; adds `position` (int) and `added_by` (FK to User), so songs have an explicit order and we know who added each one
 
-**`routes/songs.py`** — Endpoints for sharing songs, searching, rating (`POST /songs/<id>/rate`), and recording listening events.
+**`routes/songs.py`** — `POST /songs` (share), `GET /songs/search`, `POST /songs/<id>/listen`, `POST /songs/<id>/rate`
 
-**`routes/playlists.py`** — Endpoints for creating playlists and retrieving songs in a playlist (`GET /playlists/<id>/songs`).
+**`routes/playlists.py`** — `POST /playlists` (create), `POST /playlists/<id>/songs` (add song), `GET /playlists/<id>/songs` (get ordered songs)
 
-**`routes/users.py`** — Endpoints for user profiles, streaks, and notifications.
+**`routes/users.py`** — `GET /users/<id>` (profile + streak), `GET /users/<id>/notifications`, `PATCH /notifications/<id>/read`
 
-**`routes/feed.py`** — Endpoints for "Friends Listening Now" and the general activity feed.
+**`routes/feed.py`** — `GET /feed/listening-now` (friends active recently), `GET /feed/activity` (general recent feed)
 
-**`services/streak_service.py`** — Manages listening streak increments and resets. Called by the listening event route.
+**`services/streak_service.py`** — `record_listening_event()` creates a ListeningEvent and calls `update_listening_streak()`. The streak logic lives entirely in `update_listening_streak()`: it compares today's date to `user.last_listened_at` and decides whether to increment, leave unchanged, or reset.
 
-**`services/feed_service.py`** — Filters listening events by recency and friendship to produce the "Listening Now" feed.
+**`services/feed_service.py`** — `get_friends_listening_now()` filters ListeningEvents to those within a `RECENT_THRESHOLD` window from friends. `get_activity_feed()` does the same without a time filter.
 
-**`services/search_service.py`** — Queries songs matching a string against title and artist fields, joined with tags.
+**`services/search_service.py`** — `search_songs()` does a case-insensitive `ilike` match on `title` and `artist`, with an `outerjoin` to `song_tags`.
 
-**`services/notification_service.py`** — Creates Notification records and handles rating/playlist actions, each of which should trigger a notification to the song's original sharer.
+**`services/notification_service.py`** — `add_to_playlist()` adds a song to a playlist and calls `create_notification()` for the sharer. `rate_song()` upserts a Rating record. `get_notifications()` retrieves a user's notifications ordered by recency.
 
-**`services/playlist_service.py`** — Creates playlists and queries their songs ordered by the `position` column in `playlist_entries`.
+**`services/playlist_service.py`** — `get_playlist_songs()` queries songs joined via `playlist_entries`, ordered by `position` ascending.
 
 ### Data Flow — User Rates a Song
 
-1. Client sends `POST /songs/<song_id>/rate` with `{ "user_id": ..., "score": ... }`
-2. `routes/songs.py` parses the request and calls `notification_service.rate_song(user_id, song_id, score)`
-3. `rate_song()` validates the score, looks up the Song and User, upserts a Rating record, and (after the fix) calls `create_notification()` for the song's original sharer
-4. `create_notification()` persists a `Notification` row with `notification_type="song_rated"` and a human-readable body
-5. The sharer can retrieve it via `GET /users/<id>/notifications`
+1. Client sends `POST /songs/<song_id>/rate` with body `{ "user_id": "...", "score": 4 }`
+2. `routes/songs.py` extracts `user_id` and `score` from the JSON body and calls `notification_service.rate_song(user_id, song_id, score)`
+3. `rate_song()` validates score is 1–5, fetches the Song and User from the DB, then checks for an existing Rating row with `filter_by(user_id=user_id, song_id=song_id)`
+4. If a Rating exists it updates `score`; otherwise it creates a new Rating and adds it to the session
+5. `db.session.commit()` persists the rating
+6. The route returns the rating dict to the client
 
-### Patterns
+Note: there is no notification sent in this flow — the notification for ratings is missing (this is Issue #4).
 
-Every route delegates immediately to a service function. Routes handle request parsing and response formatting; all business logic lives in `services/`. This makes the bugs easy to isolate — if an endpoint misbehaves, the cause is almost always in the corresponding service file, not the route.
+### Patterns I Noticed
+
+Every route delegates immediately to a service function. Routes only do input parsing (`request.get_json()`) and response formatting (`jsonify`). All database access and business logic lives in `services/`. This means if an endpoint returns wrong data, the bug is almost certainly in the service, not the route.
+
+The notification pattern in `add_to_playlist()` is: do the main action, commit, then call `create_notification()` for the song's sharer if they weren't the one who triggered the action. This same pattern is absent from `rate_song()`.
 
 ---
 
@@ -50,58 +69,170 @@ Every route delegates immediately to a service function. Routes handle request p
 
 ### Issue #1 — My listening streak keeps resetting
 
-**How I reproduced it:** Set a user's `last_listened_at` to the prior Saturday (one day before Sunday), then called the listening event endpoint to simulate a listen on Sunday. The streak reset to 1 instead of incrementing.
+**How I reproduced it:**
 
-**How I found the root cause:** I went directly to `streak_service.py` and read `update_listening_streak()`. The logic branch for `days_since_last == 1` had an extra guard: `and today.weekday() != 6`. I looked up what `weekday()` returns — 0=Monday through 6=Sunday — and confirmed the guard was explicitly preventing the streak from incrementing on Sundays.
+```python
+# flask shell
+from models import User
+from services.streak_service import update_listening_streak
+from datetime import datetime, timezone, timedelta
 
-**The root cause:** `datetime.weekday()` returns 6 for Sunday. The condition `today.weekday() != 6` evaluated to `False` every Sunday, so any Sunday listen that was exactly one day after the previous listen fell through to the `else` branch and reset the streak to 1. Every consecutive streak that crossed a Saturday→Sunday boundary was destroyed.
+user = User.query.first()
+# Simulate: user last listened on Saturday
+user.last_listened_at = datetime(2026, 6, 27, 12, 0, tzinfo=timezone.utc)  # Saturday
+user.listening_streak = 5
 
-**Fix and side-effect check:** Removed the `and today.weekday() != 6` guard, leaving `elif days_since_last == 1:` alone. The other branches (`days_since_last == 0` for same-day no-ops and the `else` reset) are unchanged. I verified that a streak spanning Monday→Sunday→Monday now increments correctly on both Sunday and Monday.
+# Simulate: user listens on Sunday (next day)
+sunday = datetime(2026, 6, 28, 14, 0, tzinfo=timezone.utc)
+update_listening_streak(user, sunday)
+print(user.listening_streak)  # prints 1 — should be 6
+```
+
+The streak reset to 1 even though the user listened on consecutive days (Saturday then Sunday).
+
+**How I found the root cause:**
+
+I started at the route: `POST /songs/<id>/listen` in `routes/songs.py` calls `streak_service.record_listening_event()`. I read `record_listening_event()` — it creates a ListeningEvent then calls `update_listening_streak(user, now)`. I read `update_listening_streak()` top to bottom. The three branches are: `days_since_last == 0` (no-op), `days_since_last == 1` (increment), else (reset). I almost stopped there thinking it looked correct, but then I noticed the second branch had an extra condition: `days_since_last == 1 and today.weekday() != 6`. I didn't immediately know what `weekday()` returns for Sunday, so I checked — it returns 6. That confirmed: the increment branch was being skipped every Sunday, and any listen on Sunday with `days_since_last == 1` fell through to the reset.
+
+**The root cause:**
+
+`datetime.weekday()` returns 6 for Sunday. The condition `today.weekday() != 6` evaluates to `False` on every Sunday. So when a user listened Saturday and then again Sunday (`days_since_last == 1`), the full condition `days_since_last == 1 and today.weekday() != 6` was `True and False = False`. Execution fell to the `else` branch and reset the streak to 1. Any streak that crossed a Saturday→Sunday boundary was destroyed.
+
+**Fix and side-effect check:**
+
+Removed `and today.weekday() != 6` from the condition, leaving just `elif days_since_last == 1:`. The `days_since_last == 0` (same-day) and `else` (gap > 1 day) branches are unchanged. After the fix, running the flask shell reproduction above prints 6 as expected. I also verified the `days_since_last == 0` path still returns early (no change) and the reset path still fires when `days_since_last > 1`.
 
 ---
 
 ### Issue #2 — Friends Listening Now shows people from yesterday
 
-**How I reproduced it:** The seed data includes listening events from multiple days. Calling `GET /feed/listening-now` returned friends whose last listen was 20+ hours ago — clearly "yesterday" in any practical sense of "listening now."
+**How I reproduced it:**
 
-**How I found the root cause:** `feed_service.py` defines `RECENT_THRESHOLD = timedelta(hours=24)` at the top of the file. The cutoff is `datetime.now(UTC) - RECENT_THRESHOLD`. With a 24-hour window, anyone who listened in the past day qualifies as "listening now," which includes listeners from yesterday evening being shown through the following afternoon.
+The seed data includes ListeningEvents with `listened_at` timestamps from multiple days ago. After seeding:
 
-**The root cause:** The threshold was set to 24 hours, which is the right window for a general activity feed but far too wide for a "listening now" feature. A user who listened 23 hours ago is not "listening now."
+```bash
+curl http://127.0.0.1:5000/feed/listening-now?user_id=<user_id>
+```
 
-**Fix and side-effect check:** Changed `RECENT_THRESHOLD` from `timedelta(hours=24)` to `timedelta(minutes=30)`. The `get_activity_feed()` function does not use this constant (it has no time filter by design), so only `get_friends_listening_now()` is affected.
+The response included friends whose `listened_at` was 18–23 hours ago. These users weren't listening "now" by any reasonable definition.
+
+**How I found the root cause:**
+
+I went to `routes/feed.py` first and found it calls `feed_service.get_friends_listening_now(user_id)`. I opened `feed_service.py`. The first thing I saw was `RECENT_THRESHOLD = timedelta(hours=24)` at the top of the file. The cutoff is `datetime.now(UTC) - RECENT_THRESHOLD`. I read the query: it filters `ListeningEvent.listened_at >= cutoff`. With a 24-hour cutoff, any listen from the past day qualifies. I compared `get_friends_listening_now()` to `get_activity_feed()` below it — `get_activity_feed()` has no time filter by design ("returns the most recent N events regardless of when they happened"). The threshold constant is only used by the "listening now" function, but it's set to a value that's appropriate for an activity feed, not a real-time presence indicator.
+
+**The root cause:**
+
+`RECENT_THRESHOLD` was set to `timedelta(hours=24)`. This made "Friends Listening Now" include anyone who listened in the past 24 hours — which includes people who listened yesterday evening. The feature name implies recent/current activity (minutes, not hours). A user who listened 23 hours ago is not "listening now."
+
+**Fix and side-effect check:**
+
+Changed `RECENT_THRESHOLD` from `timedelta(hours=24)` to `timedelta(minutes=30)`. I checked that `get_activity_feed()` does not reference `RECENT_THRESHOLD` — it does not, so the general activity feed is unaffected. After the change, the same `curl` command returns an empty list for seed data older than 30 minutes, and returns a friend if I first POST a fresh listening event for them.
 
 ---
 
 ### Issue #3 — The same song keeps showing up twice in search
 
-**How I reproduced it:** Searched for a song that I knew had multiple tags (verifiable by checking the seed data). The same song appeared in results once per tag it had.
+**How I reproduced it:**
 
-**How I found the root cause:** `search_service.py` joins `Song` with `song_tags` using `outerjoin`. A song with N tags produces N rows in the join result. Without `.distinct()`, the query returns one result row per tag, not per song. SQLAlchemy maps each row to a `Song` object, so the same song object appears multiple times in the list.
+```bash
+curl "http://127.0.0.1:5000/songs/search?q=neon"
+```
 
-**The root cause:** The `outerjoin` on `song_tags` was needed to enable filtering by tag, but the query had no deduplication. Any song with 2 tags appeared twice; a song with 3 tags appeared three times. The current search only filters on title/artist (not on tag content), so the join is purely additive duplicates.
+The response contained the same song object (same `id`, same `title`) appearing multiple times. Cross-referencing with the seed data, the duplicated songs were ones that had multiple tags. A song with 2 tags appeared twice; one with 3 tags appeared three times.
 
-**Fix and side-effect check:** Added `.distinct()` to the query chain between the join and the filter. This collapses duplicate rows from multi-tag songs back to one result per song. The `song.to_dict()` call still loads tags via the `Song.tags` relationship (which uses `lazy="subquery"` and is unaffected by the query-level distinct).
+**How I found the root cause:**
+
+I went to `routes/songs.py`, found the search endpoint calls `search_service.search_songs(query)`, and opened `search_service.py`. The query starts with `db.session.query(Song)` then does `.outerjoin(song_tags, Song.id == song_tags.c.song_id)`. I paused on that join — `outerjoin` on a many-to-many table means each tag a song has produces a separate row in the result set. With no `.distinct()` call, SQLAlchemy returns one `Song` object per row, not per unique song. I confirmed by counting: the number of duplicate appearances matched the number of tags on that song.
+
+I also checked whether removing the join would break anything. The filter only checks `Song.title.ilike()` and `Song.artist.ilike()` — it doesn't filter on tags at all. The join serves no filtering purpose; it was likely added anticipating tag-based search that was never implemented.
+
+**The root cause:**
+
+The `outerjoin(song_tags)` produces N rows for a song with N tags. Without `.distinct()`, the query returns N copies of the same Song ORM object. `search_songs()` then calls `song.to_dict()` on each, producing N identical dicts in the response list.
+
+**Fix and side-effect check:**
+
+Added `.distinct()` to the query between the join and the filter. This collapses duplicate rows back to one result per song. The `song.to_dict()` call loads tags via `Song.tags` (a separate `lazy="subquery"` relationship), which is not affected by `.distinct()` on the main query — tags still appear correctly on each result. After the fix, the same search returns each song exactly once regardless of how many tags it has.
 
 ---
 
 ### Issue #4 — Notified when a friend added my song to a playlist but not when they rated it
 
-**How I reproduced it:** Used the API to have user A rate a song originally shared by user B, then retrieved user B's notifications. No `song_rated` notification was present, even though the rating was saved successfully.
+**How I reproduced it:**
 
-**How I found the root cause:** I compared `add_to_playlist()` and `rate_song()` in `notification_service.py` side by side. `add_to_playlist()` ends with a `create_notification()` call guarded by `if song.shared_by != added_by_user_id`. `rate_song()` has no equivalent call — it saves the Rating and returns, with no notification step.
+```bash
+# User A rates a song originally shared by User B
+curl -X POST http://127.0.0.1:5000/songs/<song_id>/rate \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": "<user_a_id>", "score": 5}'
 
-**The root cause:** The `rate_song()` function was never wired up to send a notification. The infrastructure (`create_notification()`, the `Notification` model, the notification retrieval endpoint) all existed and worked; the call was simply missing from `rate_song()`.
+# Check User B's notifications
+curl http://127.0.0.1:5000/users/<user_b_id>/notifications
+```
 
-**Fix and side-effect check:** Added a `create_notification()` call at the end of `rate_song()`, mirroring the pattern in `add_to_playlist()`: notify `song.shared_by` with type `"song_rated"` and a message including the rater's username, song title, and score, skipped if the rater is the original sharer. The rating save and return are unchanged.
+The rating was saved (the POST returned a valid rating dict), but User B's notifications list was empty. Repeating with `add_to_playlist` produced a notification correctly.
+
+**How I found the root cause:**
+
+I opened `notification_service.py` and read both `add_to_playlist()` and `rate_song()` side by side. `add_to_playlist()` ends with:
+
+```python
+if song.shared_by != added_by_user_id:
+    create_notification(
+        user_id=song.shared_by,
+        notification_type="song_added_to_playlist",
+        body=f"...",
+    )
+```
+
+`rate_song()` ends with `db.session.commit()` and `return rating` — no notification call. The infrastructure (`create_notification()`, the Notification model, the retrieval endpoint) all existed and worked. The call was simply never added to `rate_song()`.
+
+**The root cause:**
+
+`rate_song()` in `notification_service.py` saves the rating but never calls `create_notification()`. The `add_to_playlist()` function in the same file follows the correct pattern — notify the sharer unless they were the one who triggered the action. `rate_song()` is missing that entire block.
+
+**Fix and side-effect check:**
+
+Added a `create_notification()` call at the end of `rate_song()`, after `db.session.commit()` and before `return rating`, mirroring the guard from `add_to_playlist()`:
+
+```python
+if song.shared_by != user_id:
+    create_notification(
+        user_id=song.shared_by,
+        notification_type="song_rated",
+        body=f"{rater.username} rated your song '{song.title}' {score}/5.",
+    )
+```
+
+The rating upsert logic and return value are unchanged. I verified: after the fix, User B receives a `song_rated` notification when User A rates their song, and no notification is created when a user rates their own song.
 
 ---
 
 ### Issue #5 — The last song in a playlist never shows up
 
-**How I reproduced it:** Created a playlist with 3 songs. `GET /playlists/<id>/songs` returned only 2 songs — always missing the last one regardless of which song was added last.
+**How I reproduced it:**
 
-**How I found the root cause:** `playlist_service.py:get_playlist_songs()` queries songs ordered by position, then returns `[song.to_dict() for song in songs[:-1]]`. The `[:-1]` Python slice drops the last element of any list.
+```bash
+# Get songs in a playlist that has 3 songs in seed data
+curl http://127.0.0.1:5000/playlists/<playlist_id>/songs
+```
 
-**The root cause:** `songs[:-1]` is a Python list slice that returns all elements except the last one. This was presumably a typo or a copy-paste error from some other slicing context. Every playlist was missing its final song regardless of how many songs it contained.
+The response contained only 2 songs. I confirmed via flask shell that the playlist had 3 entries in `playlist_entries`. The missing song was always the one with the highest `position` value — always the last one.
 
-**Fix and side-effect check:** Changed `songs[:-1]` to `songs` (no slice). The query, ordering, and `to_dict()` call are all unchanged. Playlists with 0 or 1 songs are unaffected (slicing an empty list or single-element list returned `[]` and `[]` before — now they correctly return `[]` and the one song).
+**How I found the root cause:**
+
+I went to `routes/playlists.py`, found `GET /playlists/<id>/songs` calls `playlist_service.get_playlist_songs(playlist_id)`, and read that function in `playlist_service.py`. The query looked correct — it joins through `playlist_entries`, filters by `playlist_id`, orders by `position` ascending. Then I hit the return line:
+
+```python
+return [song.to_dict() for song in songs[:-1]]
+```
+
+`songs[:-1]` is a Python slice that returns all elements of a list *except the last one*. The query was returning the right songs in the right order; the slice was discarding the final one before returning.
+
+**The root cause:**
+
+`songs[:-1]` silently drops the last element of the list on every call. A playlist with 3 songs returns 2; a playlist with 1 song returns 0. This affected every playlist regardless of size or content.
+
+**Fix and side-effect check:**
+
+Changed `songs[:-1]` to `songs`. The query, join, filter, and ordering are all unchanged. After the fix, all three songs are returned for a 3-song playlist. Edge cases: an empty playlist still returns `[]`; a 1-song playlist now correctly returns that one song (previously returned nothing).
