@@ -2,13 +2,13 @@
 
 ## AI Usage
 
-I used Claude Code (claude-sonnet-4-6) as an AI pair programmer throughout this project.
+**Instance 1 — Codebase orientation.** I pasted each service file into Claude and asked "What is this module responsible for? What are its main functions and what does each one do?" I used this to build an initial mental model before reading the code myself. Claude's summaries were accurate at the module level but missed the interaction between functions — for example, it described `rate_song()` as handling ratings without flagging that it doesn't send a notification, because it was only looking at one function in isolation. I caught that later by reading both functions side by side.
 
-**During orientation:** I pasted each service file into Claude and asked "What is this module responsible for? What are its main functions and what does each one do?" This helped me build a mental model of the service layer quickly. I also asked it to trace the data flow for a user rating a song across routes/ and services/.
+**Instance 2 — Confirming a date API detail (Issue #1).** Once I had narrowed the streak bug to the `today.weekday() != 6` condition, I asked Claude to confirm what `datetime.weekday()` returns for each day of the week. It confirmed 0=Monday through 6=Sunday. I verified this in a Python REPL before making the fix. This saved me from having to look it up in documentation, but the diagnosis — that the Sunday exclusion was wrong — was mine before I asked.
 
-**During investigation:** I used Claude to explain Python's `datetime.weekday()` vs `isoweekday()` once I had already narrowed Issue #1 to the date comparison — I needed to confirm exactly what each method returns for Sunday before I was confident in the diagnosis. For Issue #4, I described the symptom and asked Claude to spot the structural difference between `add_to_playlist()` and `rate_song()` after I had already read both functions. For Issue #3, I asked whether a SQLAlchemy `outerjoin` without `.distinct()` could produce duplicate model instances — Claude confirmed it could and explained why.
+**Instance 3 — Structural comparison (Issue #4).** After reading both `add_to_playlist()` and `rate_song()`, I asked Claude to describe the structural difference between the two functions. It identified the missing `create_notification()` call correctly. I had already spotted the same thing myself; I used Claude to sanity-check that I wasn't missing some other path where the notification might be sent elsewhere in the codebase.
 
-**Where I verified myself:** In every case I read the relevant code myself first, formed a hypothesis, then used Claude to check my reasoning rather than to find the bug. The navigation — which file to look at, which function to trace — was mine. Claude was wrong once: when I described Issue #2 and asked what the right threshold should be for "listening now," it suggested 15 minutes; I used 30 based on reading the feature description more carefully.
+**Instance 4 — Threshold value (Issue #2).** After deciding the 24-hour threshold was wrong, I asked Claude what a reasonable window for "listening now" would be. It suggested 15 minutes. I used 30 minutes instead after re-reading the feature description, which says "recently" not "right now." I did not accept Claude's suggestion directly.
 
 ---
 
