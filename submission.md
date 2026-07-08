@@ -65,6 +65,12 @@ The notification pattern in `add_to_playlist()` is: do the main action, commit, 
 
 ---
 
+## Regression Test
+
+`tests/test_streaks.py` contains `test_streak_increments_on_sunday`, which directly tests the bug fixed in Issue #1. The test sets a user's last listen to a Saturday, then calls `update_listening_streak()` with a Sunday timestamp, and asserts the streak increments from 1 to 2. Against the buggy code (with `and today.weekday() != 6` in the condition), this test fails because the streak resets to 1 instead of incrementing. After the fix the test passes. The four other tests in the same file cover the remaining streak branches (new user, consecutive day, same-day no-op, skipped day) and all pass.
+
+---
+
 ## Root Cause Analyses
 
 ### Issue #1: My listening streak keeps resetting
